@@ -13,17 +13,37 @@ import (
 	"github.com/google/uuid"
 )
 
-func GroupAccessCheck(next http.HandlerFunc, allowedGroups []uuid.UUID) http.HandlerFunc {
+type GroupAccessChecker struct {
+	allowedGroups []uuid.UUID
+}
+
+type GroupAccessOption func(*GroupAccessChecker)
+
+func WithAllowedGroups(groups []uuid.UUID) GroupAccessOption {
+	return func(gac *GroupAccessChecker) {
+		gac.allowedGroups = groups
+	}
+}
+
+func NewGroupAccessChecker(options ...GroupAccessOption) *GroupAccessChecker {
+	gac := &GroupAccessChecker{}
+	for _, opt := range options {
+		opt(gac)
+	}
+	return gac
+}
+
+func (gac *GroupAccessChecker) GroupAccessCheck(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("Checking access for", r.Method, r.URL.Path)
 
-		roleIDs, err := GetUserAppRolesFromAccessToken(w, r)
+		roleIDs, err := gac.GetUserAppRolesFromAccessToken(w, r)
 		if err != nil {
 			return
 		}
 
-		allowed := make(map[uuid.UUID]struct{}, len(allowedGroups))
-		for _, a := range allowedGroups {
+		allowed := make(map[uuid.UUID]struct{}, len(gac.allowedGroups))
+		for _, a := range gac.allowedGroups {
 			allowed[a] = struct{}{}
 		}
 
@@ -46,7 +66,7 @@ func GroupAccessCheck(next http.HandlerFunc, allowedGroups []uuid.UUID) http.Han
 	}
 }
 
-func GetUserAppRoles(accessToken string) ([]string, int, error) {
+func (gac *GroupAccessChecker) GetUserAppRoles(accessToken string) ([]string, int, error) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
@@ -92,7 +112,7 @@ func GetUserAppRoles(accessToken string) ([]string, int, error) {
 	return roleIDs, http.StatusOK, nil
 }
 
-func GetUserAppRolesFromAccessToken(w http.ResponseWriter, r *http.Request) ([]string, error) {
+func (gac *GroupAccessChecker) GetUserAppRolesFromAccessToken(w http.ResponseWriter, r *http.Request) ([]string, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		utils.APIErrorHandler(w, "Authorization header missing", http.StatusUnauthorized)
@@ -106,7 +126,7 @@ func GetUserAppRolesFromAccessToken(w http.ResponseWriter, r *http.Request) ([]s
 	}
 	token := parts[1]
 
-	roleIDs, statusCode, err := GetUserAppRoles(token)
+	roleIDs, statusCode, err := gac.GetUserAppRoles(token)
 	if err != nil {
 		utils.APIErrorHandler(w, "Failed to get user roles from Graph API", statusCode)
 		return nil, err
