@@ -15,6 +15,7 @@ import (
 
 type GroupAccessChecker struct {
 	allowedGroups []uuid.UUID
+	cacher        Cacher
 }
 
 type GroupAccessOption func(*GroupAccessChecker)
@@ -25,10 +26,19 @@ func WithAllowedGroups(groups []uuid.UUID) GroupAccessOption {
 	}
 }
 
+func WithCacher(c Cacher) GroupAccessOption {
+	return func(gac *GroupAccessChecker) {
+		gac.cacher = c
+	}
+}
+
 func NewGroupAccessChecker(options ...GroupAccessOption) *GroupAccessChecker {
 	gac := &GroupAccessChecker{}
 	for _, opt := range options {
 		opt(gac)
+	}
+	if gac.cacher == nil {
+		gac.cacher = DummyCacher{}
 	}
 	return gac
 }
@@ -67,6 +77,16 @@ func (gac *GroupAccessChecker) GroupAccessCheck(next http.HandlerFunc) http.Hand
 }
 
 func (gac *GroupAccessChecker) GetUserAppRoles(accessToken string) ([]string, int, error) {
+	if accessToken == "" {
+		slog.Error("Access token is empty")
+		return nil, http.StatusUnauthorized, errors.New("access token is empty")
+	}
+	if roles, found, err := gac.cacher.Get(accessToken); err != nil {
+		slog.Error("Cacher get error", "error", err)
+	} else if found {
+		slog.Debug("Cache hit for access token")
+		return roles, http.StatusOK, nil
+	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
@@ -109,6 +129,7 @@ func (gac *GroupAccessChecker) GetUserAppRoles(accessToken string) ([]string, in
 	for id := range roleSet {
 		roleIDs = append(roleIDs, id)
 	}
+	gac.cacher.Set(accessToken, roleIDs)
 	return roleIDs, http.StatusOK, nil
 }
 
