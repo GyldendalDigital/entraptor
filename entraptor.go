@@ -1,4 +1,4 @@
-package auth
+package entraptor
 
 import (
 	"encoding/json"
