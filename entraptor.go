@@ -81,7 +81,8 @@ func (gac *GroupAccessChecker) GetUserAppRoles(accessToken string) ([]string, in
 		slog.Error("Access token is empty")
 		return nil, http.StatusUnauthorized, errors.New("access token is empty")
 	}
-	if roles, found, err := gac.cacher.Get(accessToken); err != nil {
+	cacheKey := gac.cacher.CacheKey(accessToken)
+	if roles, found, err := gac.cacher.Get(cacheKey); err != nil {
 		slog.Error("Cacher get error", "error", err)
 	} else if found {
 		slog.Debug("Cache hit for access token")
@@ -129,7 +130,7 @@ func (gac *GroupAccessChecker) GetUserAppRoles(accessToken string) ([]string, in
 	for id := range roleSet {
 		roleIDs = append(roleIDs, id)
 	}
-	gac.cacher.Set(accessToken, roleIDs)
+	gac.cacher.Set(cacheKey, roleIDs)
 	return roleIDs, http.StatusOK, nil
 }
 
