@@ -16,6 +16,7 @@ import (
 type GroupAccessChecker struct {
 	allowedGroups []uuid.UUID
 	cacher        Cacher
+	redirectURL   string // If set, users will be redirected here on unauthorized access
 }
 
 type GroupAccessOption func(*GroupAccessChecker)
@@ -29,6 +30,12 @@ func WithAllowedGroups(groups []uuid.UUID) GroupAccessOption {
 func WithCacher(c Cacher) GroupAccessOption {
 	return func(gac *GroupAccessChecker) {
 		gac.cacher = c
+	}
+}
+
+func WithRedirectURL(url string) GroupAccessOption {
+	return func(gac *GroupAccessChecker) {
+		gac.redirectURL = url
 	}
 }
 
@@ -68,6 +75,10 @@ func (gac *GroupAccessChecker) GroupAccessCheck(next http.HandlerFunc) http.Hand
 		}
 
 		if !authorized {
+			if gac.redirectURL != "" {
+				http.Redirect(w, r, gac.redirectURL, http.StatusFound)
+				return
+			}
 			utils.APIUnauthorized(w)
 			return
 		}
@@ -137,6 +148,10 @@ func (gac *GroupAccessChecker) GetUserAppRoles(accessToken string) ([]string, in
 func (gac *GroupAccessChecker) GetUserAppRolesFromAccessToken(w http.ResponseWriter, r *http.Request) ([]string, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
+		if gac.redirectURL != "" {
+			http.Redirect(w, r, gac.redirectURL, http.StatusFound)
+			return nil, errors.New("authorization header missing")
+		}
 		utils.APIErrorHandler(w, "Authorization header missing", http.StatusUnauthorized)
 		return nil, errors.New("authorization header missing")
 	}
