@@ -14,9 +14,10 @@ import (
 )
 
 type GroupAccessChecker struct {
-	allowedGroups []uuid.UUID
-	cacher        Cacher
-	redirectURL   string // If set, users will be redirected here on unauthorized access
+	allowedGroups      []uuid.UUID
+	allowedNamedGroups map[string]uuid.UUID
+	cacher             Cacher
+	redirectURL        string // If set, users will be redirected here on unauthorized access
 }
 
 type GroupAccessOption func(*GroupAccessChecker)
@@ -24,6 +25,12 @@ type GroupAccessOption func(*GroupAccessChecker)
 func WithAllowedGroups(groups []uuid.UUID) GroupAccessOption {
 	return func(gac *GroupAccessChecker) {
 		gac.allowedGroups = groups
+	}
+}
+
+func WithAllowedNamedGroups(groups map[string]uuid.UUID) GroupAccessOption {
+	return func(gac *GroupAccessChecker) {
+		gac.allowedNamedGroups = groups
 	}
 }
 
@@ -62,6 +69,45 @@ func (gac *GroupAccessChecker) GroupAccessCheck(next http.HandlerFunc) http.Hand
 		allowed := make(map[uuid.UUID]struct{}, len(gac.allowedGroups))
 		for _, a := range gac.allowedGroups {
 			allowed[a] = struct{}{}
+		}
+
+		authorized := false
+		for _, gid := range roleIDs {
+			if uuidVal, err := uuid.Parse(gid); err == nil {
+				if _, ok := allowed[uuidVal]; ok {
+					authorized = true
+					break
+				}
+			}
+		}
+
+		if !authorized {
+			if gac.redirectURL != "" {
+				http.Redirect(w, r, gac.redirectURL, http.StatusFound)
+				return
+			}
+			utils.APIUnauthorized(w)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+func (gac *GroupAccessChecker) NamedGroupAccessCheck(roleNames []string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slog.Debug("Checking access for", r.Method, r.URL.Path)
+
+		roleIDs, err := gac.GetUserAppRolesFromAccessToken(w, r)
+		if err != nil {
+			return
+		}
+
+		allowed := make(map[uuid.UUID]struct{})
+		for _, name := range roleNames {
+			if roleUUID, ok := gac.allowedNamedGroups[name]; ok {
+				allowed[roleUUID] = struct{}{}
+			}
 		}
 
 		authorized := false
