@@ -105,7 +105,7 @@ func (gac *GroupAccessChecker) NamedGroupAccessCheck(roleNames []string, next ht
 
 		allowed := make(map[uuid.UUID]struct{})
 		for _, name := range roleNames {
-			if roleUUID, ok := gac.allowedNamedGroups[name]; ok {
+			if roleUUID, ok := gac.allowedNamedGroups[name]; ok && roleUUID != uuid.Nil {
 				allowed[roleUUID] = struct{}{}
 			}
 		}
