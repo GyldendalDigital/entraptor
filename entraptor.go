@@ -1,13 +1,11 @@
 package entraptor
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/GyldendalDigital/entraptor/internal/utils"
 	"github.com/google/uuid"
@@ -17,6 +15,8 @@ type GroupAccessChecker struct {
 	allowedGroups      []uuid.UUID
 	allowedNamedGroups map[string]uuid.UUID
 	cacher             Cacher
+	fetcher            RolesFetcher
+	logger             *slog.Logger
 	redirectURL        string // If set, users will be redirected here on unauthorized access
 }
 
@@ -46,6 +46,27 @@ func WithRedirectURL(url string) GroupAccessOption {
 	}
 }
 
+/*
+WithRolesFetcher overrides how access tokens are resolved to app role IDs.
+The default is a GraphRolesFetcher calling Microsoft Graph; tests can
+substitute a StaticRolesFetcher to avoid network calls.
+*/
+func WithRolesFetcher(f RolesFetcher) GroupAccessOption {
+	return func(gac *GroupAccessChecker) {
+		gac.fetcher = f
+	}
+}
+
+/*
+WithLogger sets the logger used by the checker. The default discards all
+output, so production callers wanting logs must pass one explicitly.
+*/
+func WithLogger(l *slog.Logger) GroupAccessOption {
+	return func(gac *GroupAccessChecker) {
+		gac.logger = l
+	}
+}
+
 func NewGroupAccessChecker(options ...GroupAccessOption) *GroupAccessChecker {
 	gac := &GroupAccessChecker{}
 	for _, opt := range options {
@@ -54,12 +75,18 @@ func NewGroupAccessChecker(options ...GroupAccessOption) *GroupAccessChecker {
 	if gac.cacher == nil {
 		gac.cacher = DummyCacher{}
 	}
+	if gac.fetcher == nil {
+		gac.fetcher = &GraphRolesFetcher{}
+	}
+	if gac.logger == nil {
+		gac.logger = slog.New(slog.DiscardHandler)
+	}
 	return gac
 }
 
 func (gac *GroupAccessChecker) GroupAccessCheck(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		slog.Debug("Checking access for", r.Method, r.URL.Path)
+		gac.logger.Debug("Checking access", "method", r.Method, "path", r.URL.Path)
 
 		roleIDs, err := gac.GetUserAppRolesFromAccessToken(w, r)
 		if err != nil {
@@ -71,17 +98,7 @@ func (gac *GroupAccessChecker) GroupAccessCheck(next http.HandlerFunc) http.Hand
 			allowed[a] = struct{}{}
 		}
 
-		authorized := false
-		for _, gid := range roleIDs {
-			if uuidVal, err := uuid.Parse(gid); err == nil {
-				if _, ok := allowed[uuidVal]; ok {
-					authorized = true
-					break
-				}
-			}
-		}
-
-		if !authorized {
+		if !gac.anyRoleAllowed(roleIDs, allowed) {
 			if gac.redirectURL != "" {
 				http.Redirect(w, r, gac.redirectURL, http.StatusFound)
 				return
@@ -96,7 +113,7 @@ func (gac *GroupAccessChecker) GroupAccessCheck(next http.HandlerFunc) http.Hand
 
 func (gac *GroupAccessChecker) NamedGroupAccessCheck(roleNames []string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		slog.Debug("Checking access for", r.Method, r.URL.Path)
+		gac.logger.Debug("Checking access", "method", r.Method, "path", r.URL.Path)
 
 		roleIDs, err := gac.GetUserAppRolesFromAccessToken(w, r)
 		if err != nil {
@@ -110,17 +127,7 @@ func (gac *GroupAccessChecker) NamedGroupAccessCheck(roleNames []string, next ht
 			}
 		}
 
-		authorized := false
-		for _, gid := range roleIDs {
-			if uuidVal, err := uuid.Parse(gid); err == nil {
-				if _, ok := allowed[uuidVal]; ok {
-					authorized = true
-					break
-				}
-			}
-		}
-
-		if !authorized {
+		if !gac.anyRoleAllowed(roleIDs, allowed) {
 			if gac.redirectURL != "" {
 				http.Redirect(w, r, gac.redirectURL, http.StatusFound)
 				return
@@ -133,59 +140,34 @@ func (gac *GroupAccessChecker) NamedGroupAccessCheck(roleNames []string, next ht
 	}
 }
 
-func (gac *GroupAccessChecker) GetUserAppRoles(accessToken string) ([]string, int, error) {
+func (gac *GroupAccessChecker) anyRoleAllowed(roleIDs []string, allowed map[uuid.UUID]struct{}) bool {
+	for _, gid := range roleIDs {
+		if uuidVal, err := uuid.Parse(gid); err == nil {
+			if _, ok := allowed[uuidVal]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (gac *GroupAccessChecker) GetUserAppRoles(ctx context.Context, accessToken string) ([]string, int, error) {
 	if accessToken == "" {
-		slog.Error("Access token is empty")
+		gac.logger.Error("Access token is empty")
 		return nil, http.StatusUnauthorized, errors.New("access token is empty")
 	}
 	cacheKey := gac.cacher.CacheKey(accessToken)
 	if roles, found, err := gac.cacher.Get(cacheKey); err != nil {
-		slog.Error("Cacher get error", "error", err)
+		gac.logger.Error("Cacher get error", "error", err)
 	} else if found {
-		slog.Debug("Cache hit for access token")
+		gac.logger.Debug("Cache hit for access token")
 		return roles, http.StatusOK, nil
 	}
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	req, err := http.NewRequest(
-		"GET",
-		"https://graph.microsoft.com/v1.0/me/appRoleAssignments?$select=appRoleId,principalDisplayName,resourceDisplayName",
-		nil,
-	)
+
+	roleIDs, statusCode, err := gac.fetcher.FetchRoles(ctx, accessToken)
 	if err != nil {
-		slog.Error("Failed to create Graph API request", "error", err)
-		return nil, http.StatusInternalServerError, err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		slog.Error("Graph API request failed", "error", err)
-		return nil, http.StatusInternalServerError, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		slog.Error("Graph API returned non-200 status", "status", resp.Status)
-		return nil, resp.StatusCode, fmt.Errorf("graph api returned status %d: %s", resp.StatusCode, resp.Status)
-	}
-
-	var g struct {
-		Value []struct{ AppRoleID string } `json:"value"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&g); err != nil {
-		return nil, http.StatusInternalServerError, err
-	}
-
-	roleSet := make(map[string]struct{}, len(g.Value))
-	for _, v := range g.Value {
-		roleSet[v.AppRoleID] = struct{}{}
-	}
-
-	roleIDs := make([]string, 0, len(roleSet))
-	for id := range roleSet {
-		roleIDs = append(roleIDs, id)
+		gac.logger.Error("Failed to fetch user roles", "status", statusCode, "error", err)
+		return nil, statusCode, err
 	}
 	gac.cacher.Set(cacheKey, roleIDs)
 	return roleIDs, http.StatusOK, nil
@@ -209,9 +191,9 @@ func (gac *GroupAccessChecker) GetUserAppRolesFromAccessToken(w http.ResponseWri
 	}
 	token := parts[1]
 
-	roleIDs, statusCode, err := gac.GetUserAppRoles(token)
+	roleIDs, statusCode, err := gac.GetUserAppRoles(r.Context(), token)
 	if err != nil {
-		utils.APIErrorHandler(w, "Failed to get user roles from Graph API", statusCode)
+		utils.APIErrorHandler(w, "Failed to get user roles", statusCode)
 		return nil, err
 	}
 	return roleIDs, nil
