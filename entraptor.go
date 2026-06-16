@@ -3,6 +3,7 @@ package entraptor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -166,6 +167,10 @@ func (gac *GroupAccessChecker) GetUserAppRoles(ctx context.Context, accessToken 
 
 	roleIDs, statusCode, err := gac.fetcher.FetchRoles(ctx, accessToken)
 	if err != nil {
+		if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+			gac.logger.Info("Unauthorized access token", "status", statusCode)
+			return nil, statusCode, fmt.Errorf("unauthorized access token: %w", err)
+		}
 		gac.logger.Error("Failed to fetch user roles", "status", statusCode, "error", err)
 		return nil, statusCode, err
 	}
